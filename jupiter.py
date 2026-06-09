@@ -1,5 +1,6 @@
 """
 Jupiter with Priority Fees + Jito MEV Protection
+FIXED: Fast TG confirmation (returns immediately, confirms in background)
 """
 
 import os, ssl, base64, aiohttp, asyncio, certifi, logging
@@ -23,9 +24,6 @@ JUPITER_SWAP_URLS = [
 JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v2"
 RPC_URL   = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 SOL_MINT  = "So11111111111111111111111111111111111111112"
-
-# Minimum sensible priority fee — avoids 422 from fee=0 or near-zero
-MIN_PRIORITY_FEE = 25_000   # lamports (~$0.000025)
 
 def _ssl_ctx():
     return ssl.create_default_context(cafile=certifi.where())
@@ -58,15 +56,20 @@ async def _post(urls, payload):
                 async with aiohttp.ClientSession(connector=_connector()) as s:
                     async with s.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as r:
                         if r.status != 200:
-                            body = await r.text()
-                            raise RuntimeError(f"HTTP {r.status}: {body[:200]}")
+                            try:
+                                body = await r.json()
+                                detail = body.get("error") or body.get("message") or str(body)
+                            except Exception:
+                                detail = await r.text()
+                            logger.error(f"Jupiter POST {url} -> {r.status}: {detail}")
+                            raise RuntimeError(f"HTTP {r.status}: {detail}")
                         return await r.json()
             except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError) as e:
                 last_err = e
                 await asyncio.sleep(1)
             except RuntimeError:
                 raise
-    raise RuntimeError(f"All Jupiter endpoints failed")
+    raise RuntimeError(f"All Jupiter endpoints failed: {last_err}")
 
 
 class JupiterClient:
@@ -102,78 +105,61 @@ class JupiterClient:
             "slippage_bps":     slippage_bps,
         }
 
-    async def execute_swap(self, wallet, quote, use_mev_protection=True,
-                           priority_fee_lamports=None, on_confirm=None):
+    async def execute_swap(self, wallet, quote, use_mev_protection=True):
         """
-        Broadcast the swap and return the signature IMMEDIATELY (~1s).
-        Confirmation runs in the background.
-
-        on_confirm: optional async callable(sig: str, err: str | None)
-                    called once the tx lands or fails/times out.
+        Execute swap with priority fees + optional Jito MEV protection.
+        ⚡ RETURNS IMMEDIATELY (1-2 sec) - confirmation in background
         """
-        # ── Priority fee ──────────────────────────────────────────────────────
-        if priority_fee_lamports is not None:
-            fee = max(int(priority_fee_lamports), MIN_PRIORITY_FEE)
-        else:
-            raw = calculate_priority_fee(quote["in_amount_ui"])
-            fee = max(int(raw * 1e9) if raw < 1.0 else int(raw), MIN_PRIORITY_FEE)
-
-        logger.info(f"Priority fee: {fee} lamports")
-
-        # ── Build & sign ──────────────────────────────────────────────────────
-        swap_payload = {
-            "quoteResponse":             quote["_raw"],
-            "userPublicKey":             wallet.public_key,
-            "wrapAndUnwrapSol":          True,
-            "dynamicComputeUnitLimit":   True,
-            "prioritizationFeeLamports": fee,
-        }
-        swap_data = await _post(JUPITER_SWAP_URLS, swap_payload)
-        raw_tx    = base64.b64decode(swap_data["swapTransaction"])
-        tx        = VersionedTransaction.from_bytes(raw_tx)
-        signed    = VersionedTransaction(tx.message, [wallet.keypair])
-        tx_bytes  = bytes(signed)
-
+        priority_lamports = calculate_priority_fee(quote["in_amount_ui"])
+        
+        swap_data = await _post(JUPITER_SWAP_URLS, {
+            "quoteResponse": quote["_raw"], 
+            "userPublicKey": wallet.public_key,
+            "wrapAndUnwrapSol": True, 
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": int(priority_lamports),
+        })
+        raw_tx = base64.b64decode(swap_data["swapTransaction"])
+        tx     = VersionedTransaction.from_bytes(raw_tx)
+        signed = VersionedTransaction(tx.message, [wallet.keypair])
+        
         sig = None
-
-        # ── Try Jito first ────────────────────────────────────────────────────
+        
+        # Try Jito MEV protection first
         if use_mev_protection:
             try:
-                jito_sig = await send_bundle(tx_bytes)
+                jito_sig = await send_bundle(bytes(signed))
                 if jito_sig:
                     logger.info(f"Sent via Jito: {jito_sig[:8]}")
                     sig = jito_sig
+                    await asyncio.sleep(0.5)  # Brief pause
             except Exception as e:
-                logger.warning(f"Jito failed, falling back to RPC: {e}")
-
-        # ── Broadcast via RPC ─────────────────────────────────────────────────
+                logger.warning(f"Jito failed, using RPC: {e}")
+        
+        # Fall back to regular RPC
         if not sig:
             async with AsyncClient(RPC_URL) as client:
                 opts   = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
-                result = await client.send_raw_transaction(tx_bytes, opts=opts)
+                result = await client.send_raw_transaction(bytes(signed), opts=opts)
                 sig    = str(result.value)
                 logger.info(f"Sent via RPC: {sig[:8]}")
+        
+        # ✅ RETURN IMMEDIATELY - DON'T WAIT FOR CONFIRMATION
+        # Confirmation happens in background async task
+        asyncio.create_task(self._confirm_in_background(sig))
+        
+        return sig
 
-        # ── Background confirmation (non-blocking) ────────────────────────────
-        async def _confirm_bg(signature: str):
-            try:
-                async with AsyncClient(RPC_URL) as client:
-                    await self._confirm_transaction(client, signature, timeout=60)
-                logger.info(f"Confirmed: {signature[:8]}")
-                if on_confirm:
-                    await on_confirm(signature, None)
-            except TimeoutError:
-                logger.warning(f"Confirmation timeout: {signature[:8]}")
-                if on_confirm:
-                    await on_confirm(signature, "timeout")
-            except Exception as e:
-                logger.error(f"Confirmation error {signature[:8]}: {e}")
-                if on_confirm:
-                    await on_confirm(signature, str(e))
-
-        asyncio.create_task(_confirm_bg(sig))  # returns immediately
-
-        return sig  # bot gets this in ~1s, not 10-30s
+    async def _confirm_in_background(self, sig: str):
+        """Confirm transaction in background (non-blocking)"""
+        try:
+            async with AsyncClient(RPC_URL) as client:
+                await self._confirm_transaction(client, sig, timeout=60)
+            logger.info(f"✅ Confirmed: {sig[:8]}")
+        except TimeoutError:
+            logger.warning(f"⏱ Timeout: {sig[:8]} (likely still pending)")
+        except Exception as e:
+            logger.error(f"❌ Confirm error {sig[:8]}: {e}")
 
     async def get_price(self, token):
         mint  = _resolve_mint(token)

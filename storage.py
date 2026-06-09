@@ -649,3 +649,30 @@ def get_analytics(user_id: int, since_ts: int = 0) -> dict:
         "best_trade":     (best_sym, best_pnl),
         "worst_trade":    (worst_sym, worst_pnl),
     }
+
+# ── AUTO BUY CONFIG ──────────────────────────────────────────────────────────
+
+def save_auto_buy_config(user_id: int, sol_amount: float, priority_fee_sol: float, 
+                         slippage_bps: int = 100, enabled: bool = False):
+    """Save auto-buy configuration"""
+    config = {
+        "sol_amount": sol_amount,
+        "priority_fee_sol": priority_fee_sol,
+        "priority_fee_lamports": int(priority_fee_sol * 1e9),
+        "slippage_bps": slippage_bps,
+        "enabled": enabled,
+    }
+    set_setting(user_id, "auto_buy_config", config)
+
+def get_auto_buy_config(user_id: int) -> dict | None:
+    """Get auto-buy configuration"""
+    return get_setting(user_id, "auto_buy_config")
+
+def toggle_auto_buy(user_id: int) -> bool:
+    """Toggle auto-buy on/off, return new state"""
+    config = get_auto_buy_config(user_id)
+    if not config:
+        return False
+    config["enabled"] = not config["enabled"]
+    set_setting(user_id, "auto_buy_config", config)
+    return config["enabled"]

@@ -57,7 +57,8 @@ async def ack(u: Update):
     if u.callback_query:
         await u.callback_query.answer()
 
-def main_kb():
+def main_kb(user_id=None, ab_enabled=False):
+    ab_label = "🤖 Auto Buy: ON" if ab_enabled else "🤖 Auto Buy: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Dashboard",  callback_data="dashboard"),
          InlineKeyboardButton("📈 Buy",        callback_data="buy"),
@@ -74,6 +75,7 @@ def main_kb():
         [InlineKeyboardButton("🔄 Copy Trade", callback_data="copy_menu"),
          InlineKeyboardButton("🔑 Wallets",    callback_data="wallets"),
          InlineKeyboardButton("⚙️ Settings",   callback_data="settings")],
+        [InlineKeyboardButton(ab_label,        callback_data="autobuy_menu")],
     ])
 
 BOT_COMMANDS = [
@@ -101,17 +103,34 @@ BOT_COMMANDS = [
     BotCommand("importwallet","Import wallet"),
     BotCommand("settings",   "Settings"),
     BotCommand("setpin",     "Set PIN"),
+    BotCommand("autobuy_setup", "Configure auto-buy"),
+    BotCommand("autobuy",    "Toggle auto-buy ON/OFF"),
     BotCommand("help",       "Help"),
 ]
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    w = get_wallet(ctx, uid(u))
+    user_id = uid(u)
+    w = get_wallet(ctx, user_id)
     wl = f"✅ `{w.public_key[:8]}...{w.public_key[-4:]}`" if w else "⚠️ No wallet — /newwallet"
+    ab_config = storage.get_auto_buy_config(user_id)
+    ab_enabled = bool(ab_config and ab_config.get("enabled"))
     await u.message.reply_text(
         f"🤖 *Solana Trading Bot*\n\n{wl}\n\n_Jupiter • 0% bot fee_",
-        parse_mode="Markdown", reply_markup=main_kb())
+        parse_mode="Markdown", reply_markup=main_kb(user_id, ab_enabled))
+
+async def start_from_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Return to main menu from a callback button"""
+    await ack(u)
+    user_id = uid(u)
+    w = get_wallet(ctx, user_id)
+    wl = f"✅ `{w.public_key[:8]}...{w.public_key[-4:]}`" if w else "⚠️ No wallet — /newwallet"
+    ab_config = storage.get_auto_buy_config(user_id)
+    ab_enabled = bool(ab_config and ab_config.get("enabled"))
+    await u.callback_query.message.reply_text(
+        f"🤖 *Solana Trading Bot*\n\n{wl}\n\n_Jupiter • 0% bot fee_",
+        parse_mode="Markdown", reply_markup=main_kb(user_id, ab_enabled))
 
 async def help_cmd(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
@@ -362,11 +381,40 @@ async def buy_amount_recv(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sym   = ctx.user_data.get("buy_sym", "?")
         name  = ctx.user_data.get("buy_name", "?")
         slip  = storage.get_setting(user_id, "slippage", 1.0)
+        auto_confirm = storage.get_setting(user_id, "auto_confirm", False)
         await m.reply_text(f"🔍 Quote for {name}...")
         quote = await JupiterClient().get_quote(
             input_mint=SOL_MINT, output_mint=mint,
             amount_sol=sol, slippage_bps=int(slip * 100))
         ctx.user_data["pending_quote"] = quote
+
+        # AUTO-CONFIRM: skip confirmation and execute immediately
+        if auto_confirm:
+            await m.reply_text(f"⚡ Auto-confirm ON — buying {name}...")
+            tx_sig = None
+            try:
+                tx_sig = await JupiterClient().execute_swap(w, quote)
+                price_usd = 0.0
+                try: price_usd = (await JupiterClient().get_price(quote["output_mint"]))["price_usd"]
+                except Exception: pass
+                storage.record_trade(user_id, "buy", sym, quote["output_mint"],
+                                     quote["out_amount_ui"], quote["in_amount_ui"], price_usd, tx_sig)
+                await m.reply_text(
+                    f"✅ *Bought {quote['out_amount_ui']} {sym}!*\n_{name}_\n\n"
+                    f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                    parse_mode="Markdown", disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🎯 Set TP/SL", callback_data=f"tpsl_token_{quote['output_mint']}_{sym}"),
+                        InlineKeyboardButton("✖️ Skip",       callback_data="cancel"),
+                    ]])
+                )
+            except Exception as e:
+                if tx_sig:
+                    await m.reply_text(f"⚠️ Sent!\n🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                                       parse_mode="Markdown", disable_web_page_preview=True)
+                else: await m.reply_text(f"❌ {e}")
+            return ConversationHandler.END
+
         await m.reply_text(
             f"📊 *{name} ({sym})*\n\n"
             f"• Spend: `{sol} SOL`\n• Get: `{quote['out_amount_ui']} {sym}`\n"
@@ -390,30 +438,16 @@ async def confirm_buy(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"⏳ Buying {name}...")
     tx_sig = None
     try:
-        bot_obj = query.message.get_bot()
-        chat_id = query.message.chat_id
-
-        async def on_buy_confirm(sig, err):
-            if err and err != "timeout":
-                await bot_obj.send_message(chat_id,
-                    f"⚠️ Tx may have failed: `{err}`\n🔗 [Solscan](https://solscan.io/tx/{sig})",
-                    parse_mode="Markdown", disable_web_page_preview=True)
-            else:
-                await bot_obj.send_message(chat_id,
-                    f"✅ Confirmed on-chain!\n🔗 [Solscan](https://solscan.io/tx/{sig})",
-                    parse_mode="Markdown", disable_web_page_preview=True)
-
-        tx_sig = await JupiterClient().execute_swap(w, quote, on_confirm=on_buy_confirm)
+        tx_sig = await JupiterClient().execute_swap(w, quote)
         price_usd = 0.0
         try: price_usd = (await JupiterClient().get_price(quote["output_mint"]))["price_usd"]
         except Exception: pass
         storage.record_trade(user_id, "buy", sym, quote["output_mint"],
                              quote["out_amount_ui"], quote["in_amount_ui"], price_usd, tx_sig)
-        # Instant reply — tx is broadcast, not yet confirmed
+        # Ask if user wants to set TP/SL
         await query.message.reply_text(
-            f"📡 *Broadcast! Buying {quote['out_amount_ui']} {sym}*\n_{name}_\n\n"
-            f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})\n"
-            f"_Confirmation will follow shortly…_",
+            f"✅ *Bought {quote['out_amount_ui']} {sym}!*\n_{name}_\n\n"
+            f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
             parse_mode="Markdown", disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🎯 Set TP/SL", callback_data=f"tpsl_token_{quote['output_mint']}_{sym}"),
@@ -527,12 +561,78 @@ async def sell_amt_selected(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Type amount:")
         ctx.user_data["_sell_custom"] = True; return
     pct = int(query.data.split("_")[1])
-    await _sell_quote(query.message, ctx, uid(u), ctx.user_data.get("sell_bal", 0) * pct / 100)
+    amount = ctx.user_data.get("sell_bal", 0) * pct / 100
+    user_id = uid(u)
+    auto_confirm = storage.get_setting(user_id, "auto_confirm", False)
+    if auto_confirm:
+        token = ctx.user_data.get("sell_token")
+        sym   = ctx.user_data.get("sell_sym", "?")
+        name  = ctx.user_data.get("sell_name", sym)
+        slip  = storage.get_setting(user_id, "slippage", 1.0)
+        w = get_wallet(ctx, user_id)
+        if not w: await query.message.reply_text("⚠️ No wallet."); return
+        try:
+            await query.message.reply_text(f"⚡ Auto-confirm ON — selling {pct}% {name}...")
+            quote = await JupiterClient().get_quote(
+                input_mint=token, output_mint=SOL_MINT,
+                amount_tokens=amount, slippage_bps=int(slip * 100))
+            ctx.user_data.update(pending_quote=quote, sell_amount=amount)
+            tx_sig = None
+            tx_sig = await JupiterClient().execute_swap(w, quote)
+            price_usd = 0.0
+            try: price_usd = (await JupiterClient().get_price(quote["input_mint"]))["price_usd"]
+            except Exception: pass
+            storage.record_trade(user_id, "sell", sym, quote["input_mint"],
+                                 amount, quote["out_amount_ui"], price_usd, tx_sig)
+            await query.message.reply_text(
+                f"✅ *Sold {name}!*\nGot: `{quote['out_amount_ui']} SOL`\n\n"
+                f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            if tx_sig:
+                await query.message.reply_text(f"⚠️ Sent!\n🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                                               parse_mode="Markdown", disable_web_page_preview=True)
+            else: await query.message.reply_text(f"❌ {e}")
+        return
+    await _sell_quote(query.message, ctx, uid(u), amount)
 
 async def sell_custom_recv(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.pop("_sell_custom", False): return ConversationHandler.END
     try: amount = float(u.message.text.strip())
     except ValueError: await u.message.reply_text("❌ Invalid."); return ConversationHandler.END
+    user_id = uid(u)
+    auto_confirm = storage.get_setting(user_id, "auto_confirm", False)
+    if auto_confirm:
+        # Execute directly without showing confirmation prompt
+        token = ctx.user_data.get("sell_token")
+        sym   = ctx.user_data.get("sell_sym", "?")
+        name  = ctx.user_data.get("sell_name", sym)
+        slip  = storage.get_setting(user_id, "slippage", 1.0)
+        w = get_wallet(ctx, user_id)
+        if not w: await u.message.reply_text("⚠️ No wallet."); return ConversationHandler.END
+        try:
+            await u.message.reply_text(f"⚡ Auto-confirm ON — selling {name}...")
+            quote = await JupiterClient().get_quote(
+                input_mint=token, output_mint=SOL_MINT,
+                amount_tokens=amount, slippage_bps=int(slip * 100))
+            ctx.user_data.update(pending_quote=quote, sell_amount=amount)
+            tx_sig = None
+            tx_sig = await JupiterClient().execute_swap(w, quote)
+            price_usd = 0.0
+            try: price_usd = (await JupiterClient().get_price(quote["input_mint"]))["price_usd"]
+            except Exception: pass
+            storage.record_trade(user_id, "sell", sym, quote["input_mint"],
+                                 amount, quote["out_amount_ui"], price_usd, tx_sig)
+            await u.message.reply_text(
+                f"✅ *Sold {name}!*\nGot: `{quote['out_amount_ui']} SOL`\n\n"
+                f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            if tx_sig:
+                await u.message.reply_text(f"⚠️ Sent!\n🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+                                           parse_mode="Markdown", disable_web_page_preview=True)
+            else: await u.message.reply_text(f"❌ {e}")
+        return ConversationHandler.END
     await _sell_quote(u.message, ctx, uid(u), amount)
     return ConversationHandler.END
 
@@ -571,31 +671,16 @@ async def confirm_sell(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"⏳ Selling {name}...")
     tx_sig = None
     try:
-        bot_obj = query.message.get_bot()
-        chat_id = query.message.chat_id
-
-        async def on_sell_confirm(sig, err):
-            if err and err != "timeout":
-                await bot_obj.send_message(chat_id,
-                    f"⚠️ Tx may have failed: `{err}`\n🔗 [Solscan](https://solscan.io/tx/{sig})",
-                    parse_mode="Markdown", disable_web_page_preview=True)
-            else:
-                await bot_obj.send_message(chat_id,
-                    f"✅ Confirmed on-chain!\n🔗 [Solscan](https://solscan.io/tx/{sig})",
-                    parse_mode="Markdown", disable_web_page_preview=True)
-
-        tx_sig = await JupiterClient().execute_swap(w, quote, on_confirm=on_sell_confirm)
+        tx_sig = await JupiterClient().execute_swap(w, quote)
         price_usd = 0.0
         try: price_usd = (await JupiterClient().get_price(quote["input_mint"]))["price_usd"]
         except Exception: pass
         storage.record_trade(user_id, "sell", sym, quote["input_mint"],
                              ctx.user_data.get("sell_amount", quote["in_amount_ui"]),
                              quote["out_amount_ui"], price_usd, tx_sig)
-        # Instant reply — tx is broadcast, not yet confirmed
         await query.message.reply_text(
-            f"📡 *Broadcast! Selling {name}*\nExpect: `{quote['out_amount_ui']} SOL`\n\n"
-            f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})\n"
-            f"_Confirmation will follow shortly…_",
+            f"✅ *Sold {name}!*\nGot: `{quote['out_amount_ui']} SOL`\n\n"
+            f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
             parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         if tx_sig:
@@ -1239,6 +1324,10 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "confirm_buy": confirm_buy, "confirm_sell": confirm_sell,
         "cancel": cancel, "pnl_menu": pnl_menu,
         "tpsl_closeall": lambda u,c: u.callback_query.answer(),
+        "autobuy_menu":     autobuy_menu_cb,
+        "autobuy_cb_toggle": autobuy_toggle_cb,
+        "autobuy_cb_setup":  autobuy_setup_cb,
+        "start": lambda u, c: start_from_cb(u, c),
     }
     if d in simple:
         await simple[d](u, ctx)
@@ -1268,6 +1357,233 @@ async def router(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("walert_"):      await watchlist_alert(u, ctx)
     elif d.startswith("wremove_"):     await watchlist_remove(u, ctx)
     elif d.startswith("stopcopy_"):    await stop_copy(u, ctx)
+
+# ── Auto Buy ──────────────────────────────────────────────────────────────────
+
+async def autobuy_menu_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show auto-buy menu from main keyboard button"""
+    await ack(u)
+    m = msg_of(u)
+    user_id = uid(u)
+    config = storage.get_auto_buy_config(user_id)
+    enabled = bool(config and config.get("enabled"))
+
+    if config:
+        pri_fee_display = f"{config['priority_fee_sol']:.8f}".rstrip('0').rstrip('.')
+        status_text = (
+            f"{'🟢 ENABLED' if enabled else '🔴 DISABLED'}\n\n"
+            f"• Amount: `{config['sol_amount']} SOL`\n"
+            f"• Priority Fee: `{pri_fee_display} SOL`\n"
+            f"• Slippage: `{config['slippage_bps']/100}%`"
+        )
+    else:
+        status_text = "⚠️ Not configured yet"
+
+    toggle_label = "⏸ Turn OFF" if enabled else "▶️ Turn ON"
+
+    await m.reply_text(
+        f"🤖 *Auto Buy*\n\n{status_text}\n\n"
+        f"When ON, just paste any CA and it buys instantly with your preset settings.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label,      callback_data="autobuy_cb_toggle"),
+             InlineKeyboardButton("⚙️ Configure",    callback_data="autobuy_cb_setup")],
+            [InlineKeyboardButton("🏠 Menu",         callback_data="start")],
+        ])
+    )
+
+async def autobuy_toggle_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto-buy from inline button"""
+    await ack(u)
+    m = msg_of(u)
+    user_id = uid(u)
+    config = storage.get_auto_buy_config(user_id)
+
+    if not config:
+        await m.reply_text(
+            "❌ Auto Buy not configured yet.\n\nTap ⚙️ Configure first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚙️ Configure", callback_data="autobuy_cb_setup"),
+            ]])
+        )
+        return
+
+    enabled = storage.toggle_auto_buy(user_id)
+    pri_fee_display = f"{config['priority_fee_sol']:.8f}".rstrip('0').rstrip('.')
+    status = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    toggle_label = "⏸ Turn OFF" if enabled else "▶️ Turn ON"
+
+    await m.reply_text(
+        f"{'🤖 ON' if enabled else '⏸ OFF'} *Auto Buy*\n\n"
+        f"Status: {status}\n\n"
+        f"• Amount: `{config['sol_amount']} SOL`\n"
+        f"• Priority Fee: `{pri_fee_display} SOL`\n"
+        f"• Slippage: `{config['slippage_bps']/100}%`\n\n"
+        + ("✅ Now just paste a CA to auto-buy!" if enabled else "Auto-buy is paused."),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label,   callback_data="autobuy_cb_toggle"),
+             InlineKeyboardButton("⚙️ Configure", callback_data="autobuy_cb_setup")],
+            [InlineKeyboardButton("🏠 Menu",      callback_data="start")],
+        ])
+    )
+
+    # If just turned ON, prompt for CA
+    if enabled:
+        await m.reply_text("📋 Paste a token CA to buy now, or just close this.")
+
+async def autobuy_setup_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Trigger auto-buy setup from inline button"""
+    await ack(u)
+    m = msg_of(u)
+    await m.reply_text(
+        "🤖 *Auto Buy Setup*\n\n"
+        "Enter format: `SOL_AMOUNT PRIORITY_FEE_SOL SLIPPAGE_%`\n\n"
+        "Examples:\n"
+        "• `0.05 0.00005 1.0` — 0.05 SOL, 50 lamports fee, 1% slippage\n"
+        "• `0.1 0.0001 0.5` — 0.1 SOL, 100 lamports fee, 0.5% slippage\n\n"
+        "Reply with your settings:",
+        parse_mode="Markdown")
+    ctx.user_data["_setup_auto_buy"] = True
+
+async def auto_buy_setup(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Setup auto-buy configuration"""
+    await u.message.reply_text(
+        "🤖 *Auto Buy Setup*\n\n"
+        "Enter format: `SOL_AMOUNT PRIORITY_FEE_SOL SLIPPAGE_BPS`\n\n"
+        "Examples:\n"
+        "• `0.05 0.00005 1.0` — 0.05 SOL, 50 lamports fee, 1% slippage\n"
+        "• `0.1 0.0001 0.5` — 0.1 SOL, 100 lamports fee, 0.5% slippage\n\n"
+        "Reply with your settings:",
+        parse_mode="Markdown")
+    ctx.user_data["_setup_auto_buy"] = True
+
+async def auto_buy_config_recv(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receive and save auto-buy config"""
+    if not ctx.user_data.pop("_setup_auto_buy", False):
+        return
+
+    try:
+        parts = u.message.text.strip().split()
+        if len(parts) < 3:
+            await u.message.reply_text("❌ Format: `0.05 0.00005 1.0`")
+            return
+
+        sol_amt = float(parts[0])
+        pri_fee_sol = float(parts[1])
+        slip_bps = int(float(parts[2]) * 100)
+
+        if sol_amt <= 0 or pri_fee_sol < 0:
+            await u.message.reply_text("❌ Amounts must be positive")
+            return
+
+        lamports = int(pri_fee_sol * 1e9)
+        pri_fee_display = f"{pri_fee_sol:.8f}".rstrip('0').rstrip('.')
+        storage.save_auto_buy_config(uid(u), sol_amt, pri_fee_sol, slip_bps, enabled=False)
+
+        await u.message.reply_text(
+            f"✅ *Auto Buy Configured*\n\n"
+            f"• Amount: `{sol_amt} SOL`\n"
+            f"• Priority Fee: `{pri_fee_display} SOL` ({lamports:,} lamports)\n"
+            f"• Slippage: `{slip_bps/100}%`\n\n"
+            f"Use `/autobuy` to toggle ON/OFF\n"
+            f"Then just paste CA to auto-buy!",
+            parse_mode="Markdown")
+    except ValueError:
+        await u.message.reply_text("❌ Invalid format. Use: `0.05 0.00005 1.0`")
+
+async def auto_buy_toggle(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto-buy on/off"""
+    config = storage.get_auto_buy_config(uid(u))
+    if not config:
+        await u.message.reply_text(
+            "❌ Auto Buy not configured\n\n/autobuy_setup to configure",
+            parse_mode="Markdown")
+        return
+
+    enabled = storage.toggle_auto_buy(uid(u))
+    emoji = "🤖 ON" if enabled else "⏸ OFF"
+    status = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    sol_amt = config['sol_amount']
+    pri_fee = f"{config['priority_fee_sol']:.8f}".rstrip('0').rstrip('.')
+    slip_pct = config['slippage_bps'] / 100
+
+    await u.message.reply_text(
+        f"{emoji} *Auto Buy*\n\n"
+        f"• Amount: `{sol_amt} SOL`\n"
+        f"• Priority Fee: `{pri_fee} SOL`\n"
+        f"• Slippage: `{slip_pct}%`\n\n"
+        f"Status: {status}\n\n"
+        f"Now just paste CA to auto-buy!",
+        parse_mode="Markdown")
+
+async def auto_buy_execute(u: Update, ctx: ContextTypes.DEFAULT_TYPE, token_address: str):
+    """Execute auto-buy with preset config"""
+    from solana_utils import _resolve_mint
+
+    user_id = uid(u)
+    config = storage.get_auto_buy_config(user_id)
+
+    if not config or not config.get("enabled"):
+        return False
+
+    try:
+        mint = _resolve_mint(token_address)
+        meta = await get_token_meta(mint)
+        w = get_wallet(ctx, user_id)
+
+        if not w:
+            await msg_of(u).reply_text("⚠️ No wallet")
+            return False
+
+        await msg_of(u).reply_text(f"🤖 Auto-buying {meta['symbol']}...")
+
+        quote = await JupiterClient().get_quote(
+            input_mint=SOL_MINT,
+            output_mint=mint,
+            amount_sol=config["sol_amount"],
+            slippage_bps=config["slippage_bps"])
+
+        tx_sig = await JupiterClient().execute_swap(w, quote)
+
+        storage.record_trade(
+            user_id, "buy", meta["symbol"], mint,
+            quote["out_amount_ui"], config["sol_amount"], 0, tx_sig)
+
+        await msg_of(u).reply_text(
+            f"✅ *Auto-bought {meta['symbol']}!*\n\n"
+            f"• Amount: `{quote['out_amount_ui']} {meta['symbol']}`\n"
+            f"• Cost: `{config['sol_amount']} SOL`\n"
+            f"• Fee: `{config['priority_fee_sol']} SOL`\n"
+            f"🔗 [Solscan](https://solscan.io/tx/{tx_sig})",
+            parse_mode="Markdown", disable_web_page_preview=True)
+
+        return True
+    except Exception as e:
+        await msg_of(u).reply_text(f"❌ {e}")
+        return False
+
+async def handle_ca_paste(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text messages — route to auto-buy, config recv, or sell custom"""
+    text = u.message.text.strip() if u.message else ""
+
+    import re
+    is_ca = bool(re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', text))
+
+    # If waiting for auto-buy setup config (NOT a CA)
+    if ctx.user_data.get("_setup_auto_buy") and not is_ca:
+        await auto_buy_config_recv(u, ctx)
+        return
+
+    # If it looks like a Solana CA — try auto-buy first
+    if is_ca:
+        executed = await auto_buy_execute(u, ctx, text)
+        if executed:
+            return
+
+    # Fall through to sell custom if applicable
+    if ctx.user_data.get("_sell_custom"):
+        await sell_custom_recv(u, ctx)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1353,10 +1669,12 @@ def main():
         ("orders", orders_menu), ("holdings", holdings), ("watchlist", watchlist_cmd),
         ("settings", settings), ("analytics", analytics), ("alerts", alerts_menu),
         ("copylist", copy_menu), ("tp", tpsl_menu), ("sl", tpsl_menu),
+        ("autobuy_setup", auto_buy_setup), ("autobuy", auto_buy_toggle),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
     app.add_handler(CallbackQueryHandler(router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca_paste))
 
     async def post_init(application):
         await application.bot.set_my_commands(BOT_COMMANDS)
